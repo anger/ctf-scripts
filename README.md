@@ -1,2 +1,2 @@
 # ctf-scripts
-a personal repositiroy for scripts i used in ctfs
+scripts i've made/used in ctfs
